@@ -33,6 +33,7 @@ Unlike generic TTS bridges or heavy remote voice APIs, MCP Speak runs locally on
   - Native macOS `say` fallback engine for high reliability when neural dependencies are absent.
   - Asynchronous, non-overlapping FIFO audio queue for `speak_non_blocking` tool calls.
   - Synchronous execution support via `speak` tool.
+  - Pipelined streaming audio playback: sentences are broken into chunks and synthesized concurrently during playback, minimizing Time-to-First-Audio (TTFA) on long responses.
   - Interactive CLI setup wizard (`setup.py`) configuring client MCP settings and generating agent instruction files (`AGENTS.md`, `GEMINI.md`, `CLAUDE.md`, `.cursorrules`).
   - Meeting awareness: automatically detects active meetings via `~/.in-meeting` and suppresses speech audio.
   - Standalone web documentation and configuration builder (`index.html`).

@@ -27,6 +27,7 @@ from speak_server import (
     speak_non_blocking,
     speech_queue,
     is_in_meeting,
+    split_into_chunks,
 )
 
 
@@ -48,6 +49,9 @@ class TestSpeakServer(unittest.TestCase):
         self.assertIn("radio_demon", config["voice_designs"])
         self.assertIn("dr_claw", config["voice_designs"])
         self.assertIn("cynic", config["voice_designs"])
+        self.assertTrue(config.get("chunk_streaming"))
+        self.assertEqual(config.get("min_chunk_chars"), 60)
+        self.assertEqual(config.get("max_chunk_chars"), 240)
 
     def test_load_config_env_overrides(self):
         with patch.dict(
@@ -56,12 +60,18 @@ class TestSpeakServer(unittest.TestCase):
                 "MCP_SPEAK_ENGINE": "say",
                 "MCP_SPEAK_PERSONA": "neutral_mainframe",
                 "MCP_SPEAK_DEVICE": "cpu",
+                "MCP_SPEAK_CHUNK_STREAMING": "false",
+                "MCP_SPEAK_MIN_CHUNK_CHARS": "80",
+                "MCP_SPEAK_MAX_CHUNK_CHARS": "300",
             },
         ):
             config = load_config()
             self.assertEqual(config["engine"], "say")
             self.assertEqual(config["persona"], "neutral_mainframe")
             self.assertEqual(config["device"], "cpu")
+            self.assertFalse(config["chunk_streaming"])
+            self.assertEqual(config["min_chunk_chars"], 80)
+            self.assertEqual(config["max_chunk_chars"], 300)
 
     @patch("subprocess.run")
     def test_say_engine(self, mock_run):
@@ -79,6 +89,7 @@ class TestSpeakServer(unittest.TestCase):
             "engine": "omnivoice",
             "persona": "neutral_mainframe",
             "fallback_to_say": False,
+            "chunk_streaming": False,
             "voice_designs": {
                 "neutral_mainframe": {"instruct": "neutral, monotone", "speed": 1.0}
             },
@@ -373,6 +384,171 @@ class TestSpeakServer(unittest.TestCase):
             event.wait(timeout=2.0)
             self.assertTrue(event.is_set())
             mock_engine.speak.assert_not_called()
+
+    def test_split_into_chunks_basic(self):
+        text = "First sentence here. Second sentence follows. Third sentence is at the end."
+        chunks = split_into_chunks(text, min_chars=20, max_chars=100)
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[0], "First sentence here.")
+        self.assertEqual(chunks[1], "Second sentence follows.")
+        self.assertEqual(chunks[2], "Third sentence is at the end.")
+
+    def test_split_into_chunks_abbreviations_and_decimals(self):
+        text = "Mr. Reed and Dr. Smith released v2.0 in 3.14 seconds. It was a massive success for e.g. the team!"
+        chunks = split_into_chunks(text, min_chars=30, max_chars=120)
+        self.assertEqual(len(chunks), 2)
+        self.assertIn("Mr. Reed and Dr. Smith released v2.0 in 3.14 seconds.", chunks[0])
+        self.assertIn("It was a massive success for e.g. the team!", chunks[1])
+
+    def test_split_into_chunks_quotes(self):
+        text = 'He shouted, "Stop right there!" The guard drew his weapon. "Who goes there?"'
+        chunks = split_into_chunks(text, min_chars=20, max_chars=100)
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[0], 'He shouted, "Stop right there!"')
+        self.assertEqual(chunks[1], 'The guard drew his weapon.')
+        self.assertEqual(chunks[2], '"Who goes there?"')
+
+    def test_split_into_chunks_short_text(self):
+        text = "Short text."
+        chunks = split_into_chunks(text, min_chars=50, max_chars=200)
+        self.assertEqual(chunks, ["Short text."])
+
+    def test_split_into_chunks_merges_small_trailing_fragment(self):
+        text = "This is a reasonably long introductory sentence that exceeds thirty characters. Ok."
+        chunks = split_into_chunks(text, min_chars=30, max_chars=150)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0], "This is a reasonably long introductory sentence that exceeds thirty characters. Ok.")
+
+    def test_split_into_chunks_long_clause_splitting(self):
+        long_sentence = (
+            "We initiated the first phase of deployment, validated all telemetry channels across regional nodes, "
+            "confirmed memory footprints remained within nominal ranges, and finalized production synchronization."
+        )
+        chunks = split_into_chunks(long_sentence, min_chars=30, max_chars=100)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 100)
+
+    def test_split_into_chunks_empty(self):
+        self.assertEqual(split_into_chunks(""), [])
+        self.assertEqual(split_into_chunks("   \n\t  "), [])
+
+    @patch("subprocess.run")
+    def test_omnivoice_pipelined_streaming_concurrency_and_cleanup(self, mock_run):
+        """
+        Verify that multi-chunk messages are synthesized and played concurrently in a pipeline,
+        and all temporary WAV files are removed after playback.
+        """
+        config = {
+            "engine": "omnivoice",
+            "persona": "agent_smith",
+            "fallback_to_say": False,
+            "chunk_streaming": True,
+            "min_chunk_chars": 20,
+            "max_chunk_chars": 100,
+            "voice_designs": {
+                "agent_smith": {"instruct": "male, low pitch", "speed": 1.0}
+            },
+        }
+        engine = OmniVoiceEngine(config)
+        engine._resolve_voice_clone_prompt = MagicMock(return_value=None)
+
+        events_order = []
+        created_temp_files = []
+
+        def mock_synthesize(text, instruct=None, speed=1.0, voice_clone_prompt=None):
+            events_order.append(f"synth_start:{text[:12]}")
+            time.sleep(0.04)
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            created_temp_files.append(path)
+            events_order.append(f"synth_done:{text[:12]}")
+            return path
+
+        def mock_play(cmd, check=True):
+            events_order.append(f"play_start:{cmd[1]}")
+            time.sleep(0.06)
+            events_order.append(f"play_done:{cmd[1]}")
+
+        engine._synthesize_to_file = MagicMock(side_effect=mock_synthesize)
+        mock_run.side_effect = mock_play
+
+        message = (
+            "Sentence one is ready now. Sentence two is proceeding next. Sentence three concludes the test."
+        )
+        engine.speak(message)
+
+        self.assertEqual(engine._synthesize_to_file.call_count, 3)
+        self.assertEqual(mock_run.call_count, 3)
+
+        play1_start_idx = events_order.index(f"play_start:{created_temp_files[0]}")
+        play1_done_idx = events_order.index(f"play_done:{created_temp_files[0]}")
+        synth2_start_idx = events_order.index("synth_start:Sentence two")
+        synth2_done_idx = events_order.index("synth_done:Sentence two")
+
+        # Concurrency verification: Chunk 1 playback and Chunk 2 synthesis overlap in time
+        self.assertLess(play1_start_idx, synth2_done_idx, "Chunk 1 playback must begin before Chunk 2 synthesis finishes")
+        self.assertLess(synth2_start_idx, play1_done_idx, "Chunk 2 synthesis must start before Chunk 1 playback finishes")
+
+        for f in created_temp_files:
+            self.assertFalse(os.path.exists(f), f"Temporary file {f} was not cleaned up")
+
+    @patch("subprocess.run")
+    def test_omnivoice_pipelined_meeting_abort(self, mock_run):
+        """Verify pipelined streaming stops generating and playing when meeting activates."""
+        config = {
+            "engine": "omnivoice",
+            "persona": "agent_smith",
+            "fallback_to_say": False,
+            "chunk_streaming": True,
+            "min_chunk_chars": 20,
+            "max_chunk_chars": 100,
+        }
+        engine = OmniVoiceEngine(config)
+        engine._resolve_voice_clone_prompt = MagicMock(return_value=None)
+
+        created_temp_files = []
+
+        def mock_synthesize(text, instruct=None, speed=1.0, voice_clone_prompt=None):
+            time.sleep(0.02)
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            created_temp_files.append(path)
+            return path
+
+        engine._synthesize_to_file = MagicMock(side_effect=mock_synthesize)
+
+        meeting_states = [False, False, True, True, True, True, True]
+        def mock_is_in_meeting():
+            if meeting_states:
+                return meeting_states.pop(0)
+            return True
+
+        with patch("speak_server.is_in_meeting", side_effect=mock_is_in_meeting):
+            engine.speak("Sentence alpha goes here. Sentence beta goes next. Sentence gamma finishes.")
+
+        for f in created_temp_files:
+            self.assertFalse(os.path.exists(f))
+
+    @patch("subprocess.run")
+    def test_omnivoice_pipelined_error_fallback(self, mock_run):
+        """Verify pipelined synthesis errors trigger graceful fallback to macOS say."""
+        config = {
+            "engine": "omnivoice",
+            "persona": "agent_smith",
+            "fallback_to_say": True,
+            "chunk_streaming": True,
+            "min_chunk_chars": 20,
+            "max_chunk_chars": 100,
+        }
+        engine = OmniVoiceEngine(config)
+        engine._resolve_voice_clone_prompt = MagicMock(return_value=None)
+        engine._synthesize_to_file = MagicMock(side_effect=RuntimeError("Synthesis GPU crash"))
+
+        message = "Sentence one will fail. Sentence two is never reached."
+        engine.speak(message)
+
+        mock_run.assert_called_once_with(["say", message], check=True)
 
 
 if __name__ == "__main__":

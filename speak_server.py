@@ -45,12 +45,106 @@ def is_in_meeting(meeting_file: Optional[Path] = None) -> bool:
         return False
 
 
+def split_into_chunks(text: str, min_chars: int = 60, max_chars: int = 240) -> List[str]:
+    """
+    Split text into natural sentence chunks with abbreviation and boundary awareness.
+    Merges fragments below min_chars to maintain prosodic naturalness, and splits
+    long clauses exceeding max_chars to minimize synthesis latency.
+    """
+    if not text or not text.strip():
+        return []
+    text = text.strip()
+    if len(text) <= min_chars:
+        return [text]
+
+    # Protect abbreviations and decimal numbers from premature splitting
+    placeholder = "\uE000"
+
+    def mask_match(m):
+        return m.group(0).replace(".", placeholder)
+
+    abbrev_pattern = re.compile(
+        r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|St|approx|Jan|Feb|Mar|Apr|Aug|Sept|Oct|Nov|Dec|No|al)\.",
+        re.IGNORECASE,
+    )
+    masked = abbrev_pattern.sub(mask_match, text)
+    masked = re.sub(r"(\d+)\.(\d+)", rf"\1{placeholder}\2", masked)
+    masked = re.sub(r"\b([A-Z])\.", rf"\1{placeholder}", masked)
+
+    # Split into raw sentences on punctuation or newlines
+    raw_sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?]["\'”’\)\]])\s+|\n+', masked)
+    raw_sentences = [s.replace(placeholder, ".").strip() for s in raw_sentences if s.strip()]
+
+    # If any single sentence exceeds max_chars, split on clause boundaries
+    expanded = []
+    for s in raw_sentences:
+        if len(s) <= max_chars:
+            expanded.append(s)
+        else:
+            clauses = re.split(r'(?<=[;,:\u2014])\s+|(?<=--)\s+', s)
+            curr = ""
+            for c in clauses:
+                c = c.strip()
+                if not c:
+                    continue
+                if not curr:
+                    curr = c
+                elif len(curr) + 1 + len(c) <= max_chars:
+                    curr += " " + c
+                else:
+                    expanded.append(curr)
+                    curr = c
+            if curr:
+                if len(curr) > max_chars:
+                    words = curr.split()
+                    w_curr = ""
+                    for w in words:
+                        if not w_curr:
+                            w_curr = w
+                        elif len(w_curr) + 1 + len(w) <= max_chars:
+                            w_curr += " " + w
+                        else:
+                            expanded.append(w_curr)
+                            w_curr = w
+                    if w_curr:
+                        expanded.append(w_curr)
+                else:
+                    expanded.append(curr)
+
+    # Group sentences into chunks based on min_chars
+    chunks = []
+    curr = ""
+    for s in expanded:
+        if not curr:
+            curr = s
+        elif len(curr) < min_chars:
+            if len(curr) + 1 + len(s) <= max_chars:
+                curr += " " + s
+            else:
+                chunks.append(curr)
+                curr = s
+        else:
+            chunks.append(curr)
+            curr = s
+
+    if curr:
+        if chunks and len(curr) < (min_chars // 3) and (len(chunks[-1]) + 1 + len(curr) <= max_chars):
+            chunks[-1] += " " + curr
+        else:
+            chunks.append(curr)
+
+    return chunks
+
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "engine": "omnivoice",
     "persona": "agent_smith",
     "device": "auto",
     "voices_dir": "voices",
     "fallback_to_say": True,
+    "chunk_streaming": True,
+    "min_chunk_chars": 60,
+    "max_chunk_chars": 240,
     "voice_designs": {
         "agent_smith": {
             "instruct": "male, middle-aged, low pitch, american accent",
@@ -140,6 +234,19 @@ def load_config() -> Dict[str, Any]:
         config["device"] = os.environ["MCP_SPEAK_DEVICE"].strip().lower()
     if "MCP_SPEAK_VOICES_DIR" in os.environ:
         config["voices_dir"] = os.environ["MCP_SPEAK_VOICES_DIR"].strip()
+    if "MCP_SPEAK_CHUNK_STREAMING" in os.environ:
+        val = os.environ["MCP_SPEAK_CHUNK_STREAMING"].strip().lower()
+        config["chunk_streaming"] = val in ("1", "true", "yes", "on")
+    if "MCP_SPEAK_MIN_CHUNK_CHARS" in os.environ:
+        try:
+            config["min_chunk_chars"] = int(os.environ["MCP_SPEAK_MIN_CHUNK_CHARS"])
+        except ValueError:
+            pass
+    if "MCP_SPEAK_MAX_CHUNK_CHARS" in os.environ:
+        try:
+            config["max_chunk_chars"] = int(os.environ["MCP_SPEAK_MAX_CHUNK_CHARS"])
+        except ValueError:
+            pass
 
     return config
 
@@ -314,11 +421,102 @@ class OmniVoiceEngine:
         sf.write(temp_wav_path, audio_data, sampling_rate)
         return temp_wav_path
 
+    def _speak_pipelined(
+        self,
+        chunks: List[str],
+        speed: float = 1.0,
+        voice_clone_prompt: Optional[Any] = None,
+        instruct: Optional[str] = None,
+    ) -> None:
+        """
+        Pipelined synthesis and playback of audio chunks.
+        Actively synthesizes chunk N+1 in a background worker while chunk N is playing aloud.
+        """
+        if not chunks:
+            return
+
+        audio_queue: queue.Queue = queue.Queue(maxsize=2)
+        stop_event = threading.Event()
+        error_holder: List[Exception] = []
+
+        def producer():
+            try:
+                for chunk in chunks:
+                    if stop_event.is_set() or is_in_meeting():
+                        break
+
+                    if voice_clone_prompt is not None:
+                        wav_path = self._synthesize_to_file(
+                            text=chunk,
+                            speed=speed,
+                            voice_clone_prompt=voice_clone_prompt,
+                        )
+                    else:
+                        wav_path = self._synthesize_to_file(
+                            text=chunk,
+                            instruct=instruct,
+                            speed=speed,
+                        )
+
+                    if stop_event.is_set():
+                        if os.path.exists(wav_path):
+                            try:
+                                os.remove(wav_path)
+                            except OSError:
+                                pass
+                        break
+
+                    audio_queue.put(wav_path)
+            except Exception as e:
+                error_holder.append(e)
+            finally:
+                audio_queue.put(None)
+
+        producer_thread = threading.Thread(target=producer, daemon=True)
+        producer_thread.start()
+
+        try:
+            while True:
+                item = audio_queue.get()
+                if item is None:
+                    break
+                wav_path = item
+                try:
+                    if is_in_meeting():
+                        print(
+                            "[mcp-speak] In meeting ('active' in ~/.in-meeting). Skipping audio playback.",
+                            file=sys.stderr,
+                        )
+                        stop_event.set()
+                        continue
+
+                    subprocess.run(["afplay", wav_path], check=True)
+                finally:
+                    if os.path.exists(wav_path):
+                        try:
+                            os.remove(wav_path)
+                        except OSError:
+                            pass
+        finally:
+            stop_event.set()
+            producer_thread.join()
+            while not audio_queue.empty():
+                try:
+                    rem = audio_queue.get_nowait()
+                    if rem and isinstance(rem, str) and os.path.exists(rem):
+                        os.remove(rem)
+                except Exception:
+                    pass
+
+        if error_holder:
+            raise error_holder[0]
+
     def speak(self, message: str) -> None:
         """
         Speak a message using OmniVoice neural voice synthesis.
         Prefers cloned voice if reference audio exists, otherwise falls back to Voice Design.
-        Synthesizes the complete message in a single continuous pass to maintain voice consistency.
+        When chunk streaming is enabled and the message has multiple sentences, synthesizes
+        and plays chunks in an overlapping pipeline to minimize time-to-first-audio.
         """
         if not message or not message.strip():
             return
@@ -338,32 +536,51 @@ class OmniVoiceEngine:
 
             # Check if reference audio exists for persona voice cloning
             voice_clone_prompt = self._resolve_voice_clone_prompt(persona_name)
+            instruct = persona_cfg.get("instruct", "male, middle-aged, low pitch, american accent") if voice_clone_prompt is None else None
 
-            if voice_clone_prompt is not None:
-                temp_wav_path = self._synthesize_to_file(
-                    text=message,
+            chunk_streaming = self.config.get("chunk_streaming", True)
+            min_chunk_chars = int(self.config.get("min_chunk_chars", 60))
+            max_chunk_chars = int(self.config.get("max_chunk_chars", 240))
+
+            chunks = (
+                split_into_chunks(message, min_chars=min_chunk_chars, max_chars=max_chunk_chars)
+                if chunk_streaming
+                else [message]
+            )
+
+            if len(chunks) > 1:
+                self._speak_pipelined(
+                    chunks=chunks,
                     speed=speed,
                     voice_clone_prompt=voice_clone_prompt,
+                    instruct=instruct,
                 )
             else:
-                instruct = persona_cfg.get("instruct", "male, middle-aged, low pitch, american accent")
-                temp_wav_path = self._synthesize_to_file(
-                    text=message,
-                    instruct=instruct,
-                    speed=speed,
-                )
+                text_to_speak = chunks[0] if chunks else message
+                if voice_clone_prompt is not None:
+                    temp_wav_path = self._synthesize_to_file(
+                        text=text_to_speak,
+                        speed=speed,
+                        voice_clone_prompt=voice_clone_prompt,
+                    )
+                else:
+                    temp_wav_path = self._synthesize_to_file(
+                        text=text_to_speak,
+                        instruct=instruct,
+                        speed=speed,
+                    )
 
-            try:
-                if is_in_meeting():
-                    print("[mcp-speak] In meeting ('active' in ~/.in-meeting). Skipping audio playback.", file=sys.stderr)
-                    return
-                subprocess.run(["afplay", temp_wav_path], check=True)
-            finally:
-                if os.path.exists(temp_wav_path):
-                    try:
-                        os.remove(temp_wav_path)
-                    except OSError:
-                        pass
+                try:
+                    if is_in_meeting():
+                        print("[mcp-speak] In meeting ('active' in ~/.in-meeting). Skipping audio playback.", file=sys.stderr)
+                        return
+                    subprocess.run(["afplay", temp_wav_path], check=True)
+                finally:
+                    if os.path.exists(temp_wav_path):
+                        try:
+                            os.remove(temp_wav_path)
+                        except OSError:
+                            pass
 
         except Exception as e:
             print(f"[mcp-speak] Error in OmniVoice synthesis: {e}", file=sys.stderr)

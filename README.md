@@ -14,7 +14,8 @@ This is a Model Context Protocol (MCP) server that provides text-to-speech capab
 - **OmniVoice Voice Cloning:** Drop reference audio clips into `voices/<persona>.wav` to clone real vocal timbre and identity with zero configuration.
 - **OmniVoice Voice Design Fallback:** Generates custom persona voices from natural language style prompts when no reference audio file is present.
 - **3-Tier Robust Voice Pipeline:** Seamlessly falls back: `Cloned Voice (.wav)` ➔ `Voice Design (instruct)` ➔ `macOS native say`.
-- **Consistent Neural Speech:** Generates complete messages in a continuous synthesis pass for seamless, uniform vocal timbre and expression throughout.
+- **Pipelined Audio Streaming & Sentence Chunking:** Splits long messages into natural sentence chunks, beginning audio playback immediately on the first chunk while actively synthesizing subsequent chunks in the background to dramatically slash Time-to-First-Audio (TTFA).
+- **Consistent Neural Speech:** Caches cloned voice prompts across chunks to maintain uniform vocal timbre and expression throughout playback.
 - **Interactive Setup Wizard:** Run `python3 setup.py` to choose your TTS engine (OmniVoice or macOS `say`), select agent personas, and generate instruction files (`AGENTS.md`, `GEMINI.md`, `CLAUDE.md`, `.cursorrules`).
 - **Sequential Speech Queue:** Strict FIFO queue ensures multiple non-blocking speech calls never talk over each other.
 - **Automatic Fallback:** Seamlessly falls back to native macOS `say` if neural models cannot be loaded.
@@ -131,7 +132,10 @@ The server loads configuration from `config.json` at startup:
   "persona": "neutral_mainframe",
   "device": "auto",
   "voices_dir": "voices",
-  "fallback_to_say": true
+  "fallback_to_say": true,
+  "chunk_streaming": true,
+  "min_chunk_chars": 60,
+  "max_chunk_chars": 240
 }
 ```
 
@@ -143,6 +147,9 @@ Runtime parameters can be overridden via environment variables without modifying
 * `MCP_SPEAK_PERSONA`: Set to any persona key (e.g. `"agent_smith"`, `"neutral_mainframe"`).
 * `MCP_SPEAK_DEVICE`: Set to `"auto"`, `"mps"`, `"cuda"`, or `"cpu"`.
 * `MCP_SPEAK_VOICES_DIR`: Set to a custom directory path containing reference audio files.
+* `MCP_SPEAK_CHUNK_STREAMING`: Set to `"true"` or `"false"` to toggle pipelined streaming.
+* `MCP_SPEAK_MIN_CHUNK_CHARS`: Integer minimum character threshold to trigger chunk emission (default: `60`).
+* `MCP_SPEAK_MAX_CHUNK_CHARS`: Integer maximum character threshold for splitting long run-on clauses (default: `240`).
 * `MCP_SPEAK_MEETING_FILE`: Path to a custom meeting status file (defaults to `~/.in-meeting`).
 
 ### Meeting Detection & Audio Suppression

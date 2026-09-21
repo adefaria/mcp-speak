@@ -95,6 +95,12 @@ def update_project_config(engine: str, persona_key: str, device: str = None):
         data["voices_dir"] = "voices"
     if "fallback_to_say" not in data:
         data["fallback_to_say"] = True
+    if "chunk_streaming" not in data:
+        data["chunk_streaming"] = True
+    if "min_chunk_chars" not in data:
+        data["min_chunk_chars"] = 60
+    if "max_chunk_chars" not in data:
+        data["max_chunk_chars"] = 240
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
