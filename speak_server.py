@@ -21,7 +21,7 @@ def speech_worker():
     while True:
         message, event = speech_queue.get()
         try:
-            subprocess.run(["say", message], check=True)
+            subprocess.run(["say", message], check=True, stdout=subprocess.DEVNULL)
         except Exception as e:
             # We can't easily return errors to the caller if it's non-blocking,
             # but we can log it.

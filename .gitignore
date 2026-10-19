@@ -2,3 +2,36 @@
 .GEMINI.md
 AGENTS.md
 .claude/settings.local.json
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+ENV/
+env/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging & build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Configuration & local memory
+config.json
+memory/
+.mcp_memory/
+.impeccable/
+voices/*.wav
+voices/*.mp3
+voices/*.pt
+voices/*.m4a
+voices/*.txt
+!voices/README.md
